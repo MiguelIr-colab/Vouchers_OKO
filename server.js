@@ -8,32 +8,35 @@ const rateLimit = require('express-rate-limit');
 const { randomUUID, createHmac } = require('crypto');
 const Stripe = require('stripe');
 
-// ======== Validaciones de entorno mínimas ========
+/* ================== Comprobaciones de entorno ================== */
 if (!process.env.STRIPE_SECRET_KEY) throw new Error('Missing STRIPE_SECRET_KEY');
 if (!process.env.STRIPE_WEBHOOK_SECRET) console.warn('⚠️ Missing STRIPE_WEBHOOK_SECRET');
 if (!process.env.N8N_FORWARD_URL) console.warn('⚠️ Missing N8N_FORWARD_URL');
 
-// Nota: usa la clave del modo (test o live) que corresponda a tu frontend
+/* 
+   Stripe SDK.
+   - Mantengo apiVersion en "2025-01-27.acacia" para alinear con Stripe.js Acacia
+     y con lo que ves en los logs.
+   - Si tu cuenta aún no está actualizada, puedes comentar apiVersion para usar
+     la versión por defecto de la cuenta y luego actualizar desde el Dashboard.
+*/
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: '2024-06-20',
+  apiVersion: '2025-01-27.acacia',
   appInfo: { name: 'OKO Gift Cards', version: '1.0.0' },
 });
 
 const app = express();
 
-// 🚀 Estás detrás del proxy de Railway. Esto evita el error de rate-limit.
-app.set('trust proxy', 1);
-
+/* ================== Infraestructura / Seguridad ================== */
+app.set('trust proxy', 1); // Railway / PaaS
 app.disable('x-powered-by');
 
-// Seguridad básica
 app.use(helmet({
   crossOriginEmbedderPolicy: false,
   contentSecurityPolicy: false,
 }));
 
-// CORS: permite solo orígenes listados en ALLOWED_ORIGINS (coma-separados)
-// Para pruebas locales, añade http://localhost:3000 a la variable.
+// CORS: solo orígenes explícitos en ALLOWED_ORIGINS (coma-separados)
 app.use(cors({
   origin: (origin, cb) => {
     const allow = (process.env.ALLOWED_ORIGINS || '')
@@ -46,7 +49,7 @@ app.use(cors({
   credentials: false,
 }));
 
-// Rate limit (ya con trust proxy activo)
+// Rate limit básico
 app.use(rateLimit({
   windowMs: 60 * 1000,
   max: 120,
@@ -54,15 +57,16 @@ app.use(rateLimit({
   legacyHeaders: false,
 }));
 
-// ---------- RUTA DE WEBHOOK (ANTES de express.json) ----------
+/* ================== WEBHOOK (crudo) — antes de express.json ================== */
 app.post('/webhook',
   express.raw({ type: 'application/json', limit: '1mb' }),
   async (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
+
     try {
       event = stripe.webhooks.constructEvent(
-        req.body, // <- Buffer crudo
+        req.body, // buffer crudo; NO usar express.json aquí
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
@@ -96,7 +100,7 @@ app.post('/webhook',
           headers['X-OKO-Signature'] = signature;
         }
 
-        // Node 18+ tiene fetch global. Si usas otra versión, instala node-fetch.
+        // Node 18+: fetch global
         try {
           await fetch(process.env.N8N_FORWARD_URL, {
             method: 'POST',
@@ -109,20 +113,40 @@ app.post('/webhook',
       }
     } catch (err) {
       console.error('Webhook handling error:', err);
-      // Respondemos 200 igualmente para que Stripe no reintente infinitamente si es un error de negocio
+      // Respondemos 200 igualmente para no disparar reintentos infinitos si es un error de negocio
     }
 
     return res.json({ received: true });
   }
 );
 
-// ---------- Resto de rutas: ahora sí, JSON normal ----------
+/* ================== Resto de rutas: ahora sí JSON ================== */
 app.use(express.json({ limit: '200kb' }));
 
+// Diagnóstico simple (útil para comprobar modo/clave/cuenta)
+app.get('/__diag', async (_req, res) => {
+  const key = process.env.STRIPE_SECRET_KEY || '';
+  const mode = key.startsWith('sk_test_') ? 'TEST'
+    : key.startsWith('sk_live_') ? 'LIVE' : 'UNKNOWN';
+  let account = 'unknown';
+  try {
+    const acc = await stripe.accounts.retrieve();
+    account = acc.id || 'unknown';
+  } catch {}
+  res.json({
+    mode,
+    key_prefix: key.slice(0, 12),
+    account,
+    api_version: '2025-01-27.acacia',
+  });
+});
+
+// Crear PaymentIntent (para Payment Element)
 app.post('/create-payment-intent', async (req, res) => {
   try {
     const { amount, name, email, phone, message, preset } = req.body || {};
 
+    // Validaciones de importe
     const PRESETS = [5000, 10000, 15000, 20000, 30000, 40000, 50000, 60000];
     const MIN = 3000;
     const MAX = 60000;
@@ -138,6 +162,7 @@ app.post('/create-payment-intent', async (req, res) => {
     }
 
     const safe = (v, n) => typeof v === 'string' ? v.slice(0, n) : undefined;
+
     const metadata = {
       name: safe(name, 120) || '',
       email: safe(email, 200) || '',
@@ -148,6 +173,11 @@ app.post('/create-payment-intent', async (req, res) => {
 
     const idempotencyKey = req.headers['x-idempotency-key'] || randomUUID();
 
+    /* 
+       automatic_payment_methods:
+       - A partir de las versiones recientes, Stripe lo asume true por defecto,
+         pero lo dejamos explícito para claridad.
+    */
     const pi = await stripe.paymentIntents.create({
       amount: finalAmount,
       currency: 'chf',
@@ -156,9 +186,12 @@ app.post('/create-payment-intent', async (req, res) => {
       metadata,
     }, { idempotencyKey });
 
+    console.log('[PI CREATED]', pi.id, 'livemode:', pi.livemode);
+
     return res.json({
       clientSecret: pi.client_secret,
       paymentIntentId: pi.id,
+      livemode: pi.livemode, // útil para detectar si el modo se cruzó
     });
   } catch (err) {
     console.error('create-payment-intent error:', err);
@@ -166,15 +199,14 @@ app.post('/create-payment-intent', async (req, res) => {
   }
 });
 
-// Salud y raíz
+/* ================== Salud y raíz ================== */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/', (_req, res) => res.send('OKO giftcards API'));
 
-// Arranque
+/* ================== Arranque ================== */
 const PORT = Number(process.env.PORT || 4242);
 app.listen(PORT, () => console.log(`Server running on :${PORT}`));
 
-// Logs de fallos no capturados (útil en plataformas PaaS)
 process.on('unhandledRejection', (r) => console.error('unhandledRejection', r));
 process.on('uncaughtException', (e) => { console.error('uncaughtException', e); process.exit(1); });
 
