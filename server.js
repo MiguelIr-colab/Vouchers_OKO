@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config();
 
 const express = require('express');
@@ -8,70 +7,75 @@ const rateLimit = require('express-rate-limit');
 const { randomUUID, createHmac } = require('crypto');
 const Stripe = require('stripe');
 
-/* ================== Comprobaciones de entorno ================== */
+/* ================== ENV CHECK ================== */
 if (!process.env.STRIPE_SECRET_KEY) throw new Error('Missing STRIPE_SECRET_KEY');
 if (!process.env.STRIPE_WEBHOOK_SECRET) console.warn('⚠️ Missing STRIPE_WEBHOOK_SECRET');
 if (!process.env.N8N_FORWARD_URL) console.warn('⚠️ Missing N8N_FORWARD_URL');
 
-/* 
-   Stripe SDK.
-   - Mantengo apiVersion en "2025-01-27.acacia" para alinear con Stripe.js Acacia
-     y con lo que ves en los logs.
-   - Si tu cuenta aún no está actualizada, puedes comentar apiVersion para usar
-     la versión por defecto de la cuenta y luego actualizar desde el Dashboard.
-*/
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2025-01-27.acacia',
-  appInfo: { name: 'OKO Gift Cards', version: '1.0.0' },
+  appInfo: { name: 'OKO Gift Cards', version: '2.0.0' },
 });
 
 const app = express();
 
-/* ================== Infraestructura / Seguridad ================== */
-app.set('trust proxy', 1); // Railway / PaaS
+/* ================== BASIC HARDENING ================== */
+app.set('trust proxy', 1);
 app.disable('x-powered-by');
+
+/* Force HTTPS behind reverse proxy */
+if (process.env.NODE_ENV === 'production') {
+  app.use((req, res, next) => {
+    if (req.headers['x-forwarded-proto'] !== 'https') {
+      return res.status(400).send('HTTPS required');
+    }
+    next();
+  });
+}
 
 app.use(helmet({
   crossOriginEmbedderPolicy: false,
   contentSecurityPolicy: false,
 }));
 
-// CORS: solo orígenes explícitos en ALLOWED_ORIGINS (coma-separados)
+/* ================== CORS ================== */
 app.use(cors({
   origin: (origin, cb) => {
     const allow = (process.env.ALLOWED_ORIGINS || '')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
+
     if (!origin || allow.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
   credentials: false,
 }));
 
-// Rate limit básico
+/* ================== GLOBAL RATE LIMIT ================== */
 app.use(rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
 }));
 
-/* ================== WEBHOOK (crudo) — antes de express.json ================== */
+/* ================== WEBHOOK (RAW BODY) ================== */
 app.post('/webhook',
   express.raw({ type: 'application/json', limit: '1mb' }),
   async (req, res) => {
+
     const sig = req.headers['stripe-signature'];
     let event;
 
     try {
       event = stripe.webhooks.constructEvent(
-        req.body, // buffer crudo; NO usar express.json aquí
+        req.body,
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      console.error('Webhook signature verification failed:', err.message);
+      console.error('Webhook signature failed:', err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
@@ -93,6 +97,7 @@ app.post('/webhook',
         };
 
         const headers = { 'Content-Type': 'application/json' };
+
         if (process.env.FORWARD_SIGNING_SECRET) {
           const signature = createHmac('sha256', process.env.FORWARD_SIGNING_SECRET)
             .update(JSON.stringify(forwardPayload))
@@ -100,65 +105,60 @@ app.post('/webhook',
           headers['X-OKO-Signature'] = signature;
         }
 
-        // Node 18+: fetch global
         try {
           await fetch(process.env.N8N_FORWARD_URL, {
             method: 'POST',
             headers,
             body: JSON.stringify(forwardPayload),
+            signal: AbortSignal.timeout(5000)
           });
         } catch (e) {
           console.error('Forward to n8n failed:', e.message);
         }
       }
+
     } catch (err) {
-      console.error('Webhook handling error:', err);
-      // Respondemos 200 igualmente para no disparar reintentos infinitos si es un error de negocio
+      console.error('Webhook handler error:', err);
     }
 
     return res.json({ received: true });
   }
 );
 
-/* ================== Resto de rutas: ahora sí JSON ================== */
+/* ================== JSON PARSER ================== */
 app.use(express.json({ limit: '200kb' }));
 
-// Diagnóstico simple (útil para comprobar modo/clave/cuenta)
-app.get('/__diag', async (_req, res) => {
-  const key = process.env.STRIPE_SECRET_KEY || '';
-  const mode = key.startsWith('sk_test_') ? 'TEST'
-    : key.startsWith('sk_live_') ? 'LIVE' : 'UNKNOWN';
-  let account = 'unknown';
-  try {
-    const acc = await stripe.accounts.retrieve();
-    account = acc.id || 'unknown';
-  } catch {}
-  res.json({
-    mode,
-    key_prefix: key.slice(0, 12),
-    account,
-    api_version: '2025-01-27.acacia',
-  });
+/* ================== PAYMENT LIMITER ================== */
+const paymentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
 });
 
-// Crear PaymentIntent (para Payment Element)
-app.post('/create-payment-intent', async (req, res) => {
+/* ================== CREATE PAYMENT INTENT ================== */
+app.post('/create-payment-intent', paymentLimiter, async (req, res) => {
   try {
     const { amount, name, email, phone, message, preset } = req.body || {};
 
-    // Validaciones de importe
+    if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+      return res.status(400).json({ error: 'Invalid email' });
+    }
+
     const PRESETS = [5000, 10000, 15000, 20000, 30000, 40000, 50000, 60000];
     const MIN = 3000;
     const MAX = 60000;
 
     let finalAmount = Number(amount);
+
     if (preset === true) {
       if (!Number.isInteger(finalAmount) || !PRESETS.includes(finalAmount)) {
         return res.status(400).json({ error: 'Invalid preset amount' });
       }
     } else {
-      if (!Number.isInteger(finalAmount)) return res.status(400).json({ error: 'Invalid amount' });
-      if (finalAmount < MIN || finalAmount > MAX) return res.status(400).json({ error: 'Amount out of range' });
+      if (!Number.isInteger(finalAmount))
+        return res.status(400).json({ error: 'Invalid amount' });
+
+      if (finalAmount < MIN || finalAmount > MAX)
+        return res.status(400).json({ error: 'Amount out of range' });
     }
 
     const safe = (v, n) => typeof v === 'string' ? v.slice(0, n) : undefined;
@@ -173,11 +173,6 @@ app.post('/create-payment-intent', async (req, res) => {
 
     const idempotencyKey = req.headers['x-idempotency-key'] || randomUUID();
 
-    /* 
-       automatic_payment_methods:
-       - A partir de las versiones recientes, Stripe lo asume true por defecto,
-         pero lo dejamos explícito para claridad.
-    */
     const pi = await stripe.paymentIntents.create({
       amount: finalAmount,
       currency: 'chf',
@@ -186,27 +181,42 @@ app.post('/create-payment-intent', async (req, res) => {
       metadata,
     }, { idempotencyKey });
 
-    console.log('[PI CREATED]', pi.id, 'livemode:', pi.livemode);
-
     return res.json({
       clientSecret: pi.client_secret,
       paymentIntentId: pi.id,
-      livemode: pi.livemode, // útil para detectar si el modo se cruzó
+      livemode: pi.livemode,
     });
+
   } catch (err) {
     console.error('create-payment-intent error:', err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
-/* ================== Salud y raíz ================== */
+/* ================== HEALTH ================== */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/', (_req, res) => res.send('OKO giftcards API'));
 
-/* ================== Arranque ================== */
+/* ================== DEV DIAG ONLY ================== */
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/__diag', async (_req, res) => {
+    const key = process.env.STRIPE_SECRET_KEY || '';
+    const mode = key.startsWith('sk_test_') ? 'TEST'
+      : key.startsWith('sk_live_') ? 'LIVE' : 'UNKNOWN';
+    res.json({ mode });
+  });
+}
+
+/* ================== START ================== */
 const PORT = Number(process.env.PORT || 4242);
-app.listen(PORT, () => console.log(`Server running on :${PORT}`));
+
+app.listen(PORT, '0.0.0.0', () =>
+  console.log(`Server running on :${PORT}`)
+);
 
 process.on('unhandledRejection', (r) => console.error('unhandledRejection', r));
-process.on('uncaughtException', (e) => { console.error('uncaughtException', e); process.exit(1); });
+process.on('uncaughtException', (e) => {
+  console.error('uncaughtException', e);
+  process.exit(1);
+});
 
